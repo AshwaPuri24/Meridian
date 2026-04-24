@@ -33,6 +33,46 @@ export type ShipmentStatus =
   | 'delivered'; // journey complete
 
 // ─────────────────────────────────────────────────────────────
+// Transport mode enum
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * The four classes Meridian routes across.
+ *
+ * OCEAN / AIR — free-space routing: routes are short, sparse LineStrings
+ *               (typically 2–10 waypoints on great-circle arcs).
+ * ROAD / RAIL — constrained routing: routes follow real infrastructure
+ *               and arrive as dense polylines from Google Maps Directions
+ *               API or similar (can contain hundreds of coordinates).
+ */
+export type TransportMode = 'OCEAN' | 'AIR' | 'ROAD' | 'RAIL';
+
+export const TRANSPORT_MODES: readonly TransportMode[] = [
+  'OCEAN',
+  'AIR',
+  'ROAD',
+  'RAIL',
+] as const;
+
+// ─────────────────────────────────────────────────────────────
+// Vehicle constraints sub-document
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Optional hints the Orchestrator Agent consumes when scoring
+ * alternate routes. Not strictly required on every shipment —
+ * absent fields mean "no constraint".
+ */
+export interface IVehicleConstraints {
+  /** Maximum cargo weight the assigned vehicle can carry (tonnes). */
+  maxWeight?: number;
+  /** True = refrigerated / temperature-controlled transit required. */
+  requiresColdChain?: boolean;
+  /** UN hazardous-material class label, e.g. "3" (flammable liquid). */
+  hazmatClass?: string;
+}
+
+// ─────────────────────────────────────────────────────────────
 // Shipment document interface
 // ─────────────────────────────────────────────────────────────
 
@@ -50,6 +90,16 @@ export interface IShipment extends Document {
   /** IATA / hub code for the destination city */
   toCode: string;
 
+  /**
+   * Mode of transport. Drives which external routing engine the
+   * Orchestrator Agent consults (great-circle vs. Google Maps
+   * Directions / rail network graph) and which constraints apply.
+   */
+  transportMode: TransportMode;
+
+  /** Optional vehicle-level constraints used by the AI for scoring. */
+  vehicleConstraints?: IVehicleConstraints;
+
   /** GeoJSON Point: shipment departure hub */
   origin: IGeoPoint;
 
@@ -63,8 +113,15 @@ export interface IShipment extends Document {
   currentLocation: IGeoPoint;
 
   /**
-   * GeoJSON LineString: the currently-active route path.
-   * Replaced when an OptimizationLog is EXECUTED.
+   * GeoJSON LineString — the currently-active route path.
+   *
+   * Intentionally a plain GeoJSON LineString so it transparently
+   * accepts:
+   *   • OCEAN / AIR — 2–10 sparse waypoints on a great-circle arc.
+   *   • ROAD / RAIL — dense polylines (hundreds of coordinates)
+   *     returned by Google Maps Directions API or a rail graph.
+   *
+   * Replaced wholesale when an OptimizationLog is EXECUTED.
    */
   activeRoute: IGeoLineString;
 
@@ -120,8 +177,18 @@ const GeoLineStringSchema = new Schema<IGeoLineString>(
       type: [[Number]],
       required: true,
       validate: {
-        validator: (v: number[][]) => v.length >= 2,
-        message: 'A LineString must have at least 2 coordinate pairs',
+        // No upper bound on length: Google Maps polylines for Road / Rail
+        // routes can contain hundreds of vertices and must be preserved
+        // verbatim so the map renders the real road geometry.
+        validator: (v: number[][]) =>
+          v.length >= 2 &&
+          v.every(pair =>
+            pair.length === 2 &&
+            pair[0] >= -180 && pair[0] <= 180 &&
+            pair[1] >= -90  && pair[1] <= 90
+          ),
+        message:
+          'LineString must have ≥ 2 pairs; each [longitude(-180–180), latitude(-90–90)]',
       },
     },
   },
@@ -134,6 +201,15 @@ const ETAMetricsSchema = new Schema<IETAMetrics>(
     originalArrival:   { type: String, required: true },
     delayMinutes:      { type: Number, required: true, default: 0 },
     absoluteArrivalAt: { type: Date,   default: null },
+  },
+  { _id: false }
+);
+
+const VehicleConstraintsSchema = new Schema<IVehicleConstraints>(
+  {
+    maxWeight:         { type: Number,  min: 0 },
+    requiresColdChain: { type: Boolean, default: false },
+    hazmatClass:       { type: String,  trim: true },
   },
   { _id: false }
 );
@@ -157,6 +233,17 @@ const ShipmentSchema = new Schema<IShipment>(
 
     fromCode: { type: String, required: true, uppercase: true, trim: true },
     toCode:   { type: String, required: true, uppercase: true, trim: true },
+
+    transportMode: {
+      type: String,
+      enum: TRANSPORT_MODES as unknown as TransportMode[],
+      required: true,
+      default: 'OCEAN',
+      uppercase: true,
+      trim: true,
+    },
+
+    vehicleConstraints: { type: VehicleConstraintsSchema, default: undefined },
 
     origin:          { type: GeoPointSchema,      required: true },
     destination:     { type: GeoPointSchema,      required: true },
@@ -191,6 +278,9 @@ ShipmentSchema.index({ activeRoute:     '2dsphere' });
 
 // Compound index for fast status-filtered list queries
 ShipmentSchema.index({ status: 1, updatedAt: -1 });
+
+// Compound index for mode-scoped queries (e.g. "all ROAD shipments at risk")
+ShipmentSchema.index({ transportMode: 1, status: 1 });
 
 // ─────────────────────────────────────────────────────────────
 // Model export

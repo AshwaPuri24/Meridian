@@ -26,8 +26,14 @@ import { RunnableSequence }            from '@langchain/core/runnables';
 import { z }                           from 'zod';
 
 // Local model types (used for strong typing on function parameters)
-import type { IShipment }   from '../models/Shipment';
-import type { IRiskAlert }  from '../models/RiskAlert';
+import type { IShipment, TransportMode } from '../models/Shipment';
+import type { IRiskAlert }               from '../models/RiskAlert';
+import type { IGeoLineString }           from '../types/geo';
+
+// Physical-network router for ROAD mode.
+// Gemini is still consulted for strategy, but the final coordinates
+// for a truck reroute come from Google Maps so they follow real highways.
+import { calculateRoadDetour, GoogleMapsServiceError } from './GoogleMapsService';
 
 // ─────────────────────────────────────────────────────────────
 // 1.  MODEL INITIALIZATION
@@ -201,7 +207,28 @@ const OrchestratorOutputSchema = z.object({
     .enum(['AUTO_APPROVED', 'REQUIRES_HUMAN_SIGNOFF'])
     .describe(
       'Set to AUTO_APPROVED only if confidenceScore ≥ 0.85 AND cargo risk class is non-critical. ' +
-      'All pharma, live-animal, or high-value (>$500k) cargo MUST use REQUIRES_HUMAN_SIGNOFF.'
+      'All pharma, live-animal, or high-value (>$500k) cargo MUST use REQUIRES_HUMAN_SIGNOFF. ' +
+      'If haltRequired is true, this MUST be REQUIRES_HUMAN_SIGNOFF — halting a train needs sign-off.'
+    ),
+
+  // ── RAIL halt flag ───────────────────────────────────────
+
+  /**
+   * RAIL-only directive. True = the train cannot safely detour and must
+   * stop at its current position until the hazard clears. For OCEAN,
+   * AIR, and ROAD this is always false.
+   *
+   * When true, the server will override proposedRoute to a zero-length
+   * LineString at currentLocation, irrespective of any coordinates
+   * Gemini produced.
+   */
+  haltRequired: z
+    .boolean()
+    .default(false)
+    .describe(
+      'RAIL only. Set to true if the train must HALT at its current location ' +
+      'because no viable rail detour exists and the delay is not catastrophic. ' +
+      'Must be false for OCEAN, AIR, and ROAD shipments.'
     ),
 });
 
@@ -234,28 +261,73 @@ const parser = StructuredOutputParser.fromZodSchema(OrchestratorOutputSchema);
  *   {hazardData}           → JSON.stringify of the IRiskAlert doc
  */
 const SYSTEM_TEMPLATE = `
-You are Meridian's Orchestrator Agent — an expert predictive logistics AI
+You are Meridian's Orchestrator Agent — a multi-modal logistics AI
 responsible for protecting global supply chains from disruptions.
+You route across four transport modes and you MUST respect the
+physical constraints of each one.
 
 Your analytical mandate:
   1. Receive a live shipment and an active hazard that intersects its route.
   2. Evaluate the risk to cargo, timeline, and cost.
-  3. Propose the single best alternate route from the available options you
-     reason about (consider geographic detours, intermediate hub cities, and
-     oceanic routing adjustments).
+  3. Propose the single best alternate strategy subject to the mode-specific
+     rules below.
   4. Produce a machine-readable rerouting decision in strict JSON.
 
-Operational constraints you MUST respect:
-  - Prefer alternate routes where the intersection risk probability is < 0.15.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MODE-SPECIFIC PHYSICAL CONSTRAINTS  (transportMode on the shipment)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+• OCEAN / AIR — free-space routing
+    You may produce GEOMETRIC free-space detours. A handful of sparse
+    [lon, lat] waypoints tracing a great-circle arc around the hazard
+    is the correct shape. Include ≥ 3 intermediate waypoints for any
+    intercontinental reroute. This is the normal, expected behaviour.
+
+• ROAD — constrained to real highways
+    Trucks CANNOT fly. You do NOT control the final polyline — a
+    downstream Google Maps Directions service will generate the
+    actual road geometry from the shipment's origin, destination and
+    the hazard polygon. Your job is strategic only:
+       - Decide IF a detour is justified.
+       - Describe the general direction in aiReasoning
+         (e.g. "take a northern detour via Nagpur").
+       - Pick a short selectedAlternate label
+         (e.g. "ROAD detour — northern arc").
+       - Produce a plausible proposedRoute (≥ 2 waypoints) as a
+         placeholder. It WILL be overwritten with the real highway
+         polyline before persistence, so do not over-invest in it.
+    haltRequired MUST be false for ROAD.
+
+• RAIL — cannot detour easily
+    Rail infrastructure is fixed; plausible detours rarely exist.
+    Heavily weight your decision toward HALTING. Only propose a rail
+    reroute when the delay from halting would be catastrophic
+    (e.g. perishable cargo with clearance > 24 h, or time-critical
+    humanitarian freight).
+    If halting is the right call:
+       - Set haltRequired = true.
+       - Set action = REQUIRES_HUMAN_SIGNOFF (always — humans must
+         authorise stopping a train).
+       - Use selectedAlternate = "HALT — await hazard clearance".
+       - Set timeSavedMinutes to the full projected delay
+         (positive number).
+       - proposedRoute will be overwritten to end at the train's
+         current location; you may still emit a placeholder.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+UNIVERSAL CONSTRAINTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - Prefer alternates where the hazard intersection probability is < 0.15.
   - Penalise delay at $1,200 USD per hour for refrigerated or pharma cargo.
   - Penalise delay at $400 USD per hour for standard cargo.
   - If the cargo description contains "pharma", "refrigerat", "medical",
     "live", or "cold-chain", set action = REQUIRES_HUMAN_SIGNOFF regardless
     of confidence score.
   - Only set action = AUTO_APPROVED when confidenceScore >= 0.85 AND cargo
-    is NOT in a critical class (see above).
-  - Produce at least 3 intermediate waypoints in the proposedRoute coordinates
-    for any intercontinental reroute.
+    is NOT in a critical class AND haltRequired is false.
+  - Respect vehicleConstraints (maxWeight, requiresColdChain, hazmatClass)
+    when reasoning about viable alternates.
   - Do NOT hallucinate data not present in the input. If you cannot compute
     a precise figure, use your best conservative estimate and lower the
     confidenceScore accordingly.
@@ -319,18 +391,22 @@ const chain = RunnableSequence.from([
  * the token count lean and avoid confusing the model.
  */
 interface ShipmentContext {
-  trackingId:       string;
-  cargoDescription: string;
-  weightTonnes:     number;
-  fromCode:         string;
-  toCode:           string;
-  origin:           IShipment['origin'];
-  destination:      IShipment['destination'];
-  currentLocation:  IShipment['currentLocation'];
-  activeRoute:      IShipment['activeRoute'];
-  progress:         number;
-  status:           string;
-  eta:              IShipment['eta'];
+  trackingId:         string;
+  cargoDescription:   string;
+  weightTonnes:       number;
+  fromCode:           string;
+  toCode:             string;
+  /** Drives the mode-specific routing rules in the system prompt. */
+  transportMode:      TransportMode;
+  /** Optional vehicle-level hints (maxWeight, coldChain, hazmat). */
+  vehicleConstraints: IShipment['vehicleConstraints'];
+  origin:             IShipment['origin'];
+  destination:        IShipment['destination'];
+  currentLocation:    IShipment['currentLocation'];
+  activeRoute:        IShipment['activeRoute'];
+  progress:           number;
+  status:             string;
+  eta:                IShipment['eta'];
 }
 
 /** Subset of IRiskAlert fields we send to Gemini */
@@ -374,18 +450,20 @@ export async function evaluateReroute(
 
   // ── Serialize only what the model needs ─────────────────
   const shipmentContext: ShipmentContext = {
-    trackingId:       shipment.trackingId,
-    cargoDescription: shipment.cargoDescription,
-    weightTonnes:     shipment.weightTonnes,
-    fromCode:         shipment.fromCode,
-    toCode:           shipment.toCode,
-    origin:           shipment.origin,
-    destination:      shipment.destination,
-    currentLocation:  shipment.currentLocation,
-    activeRoute:      shipment.activeRoute,
-    progress:         shipment.progress,
-    status:           shipment.status,
-    eta:              shipment.eta,
+    trackingId:         shipment.trackingId,
+    cargoDescription:   shipment.cargoDescription,
+    weightTonnes:       shipment.weightTonnes,
+    fromCode:           shipment.fromCode,
+    toCode:             shipment.toCode,
+    transportMode:      shipment.transportMode,
+    vehicleConstraints: shipment.vehicleConstraints,
+    origin:             shipment.origin,
+    destination:        shipment.destination,
+    currentLocation:    shipment.currentLocation,
+    activeRoute:        shipment.activeRoute,
+    progress:           shipment.progress,
+    status:             shipment.status,
+    eta:                shipment.eta,
   };
 
   const hazardContext: HazardContext = {
@@ -399,18 +477,17 @@ export async function evaluateReroute(
     expectedClearanceAt: hazard.expectedClearanceAt,
   };
 
-  // ── Primary attempt ──────────────────────────────────────
+  // ── Primary attempt → fall back to raw-parse retry ────────
+  // Both paths converge on `baseDecision` so mode-specific
+  // post-processing (below) can run exactly once.
+  let baseDecision: OrchestratorOutput;
+
   try {
-    const result = await chain.invoke({
+    baseDecision = await chain.invoke({
       shipmentData:        JSON.stringify(shipmentContext, null, 2),
       hazardData:          JSON.stringify(hazardContext,   null, 2),
       format_instructions: parser.getFormatInstructions(),
     });
-
-    return {
-      ...result,
-      generatedAt: new Date().toISOString(),
-    };
 
   } catch (primaryError) {
     // ── Retry once with an explicit JSON extraction nudge ──
@@ -446,12 +523,7 @@ export async function evaluateReroute(
         .trim();
 
       // Parse and validate through Zod manually
-      const parsed = OrchestratorOutputSchema.parse(JSON.parse(stripped));
-
-      return {
-        ...parsed,
-        generatedAt: new Date().toISOString(),
-      };
+      baseDecision = OrchestratorOutputSchema.parse(JSON.parse(stripped));
 
     } catch (retryError) {
       // Both attempts failed — surface a rich error for the caller
@@ -461,6 +533,139 @@ export async function evaluateReroute(
         primaryError instanceof Error ? primaryError : new Error(String(primaryError)),
         retryError   instanceof Error ? retryError   : new Error(String(retryError)),
       );
+    }
+  }
+
+  // ── Mode-specific post-processing ────────────────────────
+  // ROAD shipments get their proposedRoute overwritten with a real
+  // Google Maps polyline. RAIL halts get the route pinned to the
+  // train's current position. OCEAN / AIR are passed through.
+  const finalized = await applyModePostProcessing(baseDecision, shipment, hazard);
+
+  return {
+    ...finalized,
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// 6b. Mode-specific post-processing
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * applyModePostProcessing
+ * ───────────────────────
+ * Takes a Zod-validated decision produced by Gemini and enforces
+ * the physical-routing contract for the shipment's transportMode.
+ *
+ *   OCEAN / AIR  → pass through; Gemini's geometric waypoints are
+ *                  the authoritative route. haltRequired is forced
+ *                  to false (non-RAIL modes cannot halt).
+ *
+ *   ROAD         → origin / destination / hazard polygon are passed
+ *                  to GoogleMapsService.calculateRoadDetour() and
+ *                  the returned polyline replaces Gemini's placeholder
+ *                  coordinates. Any failure is wrapped in
+ *                  OrchestratorError so the caller's existing 502
+ *                  handling fires.
+ *
+ *   RAIL + halt  → proposedRoute is overwritten with a zero-length
+ *                  LineString anchored at the train's current location
+ *                  and action is forced to REQUIRES_HUMAN_SIGNOFF.
+ *                  Callers should read `haltRequired` on the returned
+ *                  decision and map the shipment status accordingly
+ *                  (e.g. set Shipment.status = 'halted').
+ *
+ *   RAIL + no halt → Gemini's waypoints pass through (no rail graph
+ *                  is available on the server side).
+ */
+async function applyModePostProcessing(
+  decision: OrchestratorOutput,
+  shipment: IShipment,
+  hazard:   IRiskAlert,
+): Promise<OrchestratorOutput> {
+
+  switch (shipment.transportMode) {
+
+    case 'OCEAN':
+    case 'AIR': {
+      // Free-space modes: Gemini's geometric waypoints are authoritative.
+      // Non-RAIL modes can never halt.
+      return { ...decision, haltRequired: false };
+    }
+
+    case 'ROAD': {
+      // Physical-highway routing. The hazard is a Polygon; its outer
+      // ring is coordinates[0]. We only pass it to the Directions
+      // service if it's well-formed.
+      const hazardRing = hazard.hazardZone?.coordinates?.[0];
+      const ringForDetour =
+        Array.isArray(hazardRing) && hazardRing.length > 0
+          ? (hazardRing as [number, number][])
+          : undefined;
+
+      try {
+        const realRoute: IGeoLineString = await calculateRoadDetour(
+          shipment.origin.coordinates,
+          shipment.destination.coordinates,
+          ringForDetour,
+        );
+
+        return {
+          ...decision,
+          proposedRoute: {
+            type:        'LineString',
+            coordinates: realRoute.coordinates,
+          },
+          haltRequired: false,
+        };
+
+      } catch (err) {
+        // Wrap as OrchestratorError so evaluateReroute's caller sees
+        // a uniform failure type (already handled in LogisticsController
+        // with a 502 response).
+        const detail = err instanceof GoogleMapsServiceError
+          ? `Google Maps Directions failed (${err.status ?? 'no-status'}): ${err.message}`
+          : err instanceof Error
+            ? err.message
+            : String(err);
+
+        throw new OrchestratorError(
+          `ROAD reroute could not be materialised via Google Maps for shipment ` +
+          `${shipment.trackingId} (hazard ${hazard.alertId}). ${detail}`,
+          err instanceof Error ? err : new Error(detail),
+          new Error('Google Maps override attempted after successful Gemini decision'),
+        );
+      }
+    }
+
+    case 'RAIL': {
+      if (!decision.haltRequired) {
+        // Gemini chose a rail alternate rather than halting. We have
+        // no rail network graph, so its waypoints pass through.
+        return decision;
+      }
+
+      // HALT: the train stops here. Pin the proposed path to the
+      // current location (min 2 coords to satisfy the LineString
+      // validator) and force human sign-off.
+      const [lon, lat] = shipment.currentLocation.coordinates;
+      return {
+        ...decision,
+        proposedRoute: {
+          type:        'LineString',
+          coordinates: [[lon, lat], [lon, lat]],
+        },
+        action: 'REQUIRES_HUMAN_SIGNOFF',
+      };
+    }
+
+    default: {
+      // Exhaustive guard — if TransportMode grows a new variant,
+      // the compiler will point here and force an explicit branch.
+      const _exhaustive: never = shipment.transportMode;
+      void _exhaustive;
+      return decision;
     }
   }
 }

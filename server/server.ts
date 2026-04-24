@@ -61,7 +61,7 @@ import apiRouter         from './routes/api';
 // 2. Environment validation
 // ─────────────────────────────────────────────────────────────
 
-const REQUIRED_VARS = ['MONGODB_URI', 'GOOGLE_API_KEY'] as const;
+const REQUIRED_VARS = ['MONGODB_URI', 'GOOGLE_API_KEY', 'GOOGLE_MAPS_API_KEY'] as const;
 
 for (const v of REQUIRED_VARS) {
   if (!process.env[v]) {

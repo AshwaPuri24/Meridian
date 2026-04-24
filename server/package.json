@@ -5,15 +5,16 @@
   "private": true,
   "main": "server.ts",
   "scripts": {
-    "dev":        "tsx --tsconfig tsconfig.json server.ts",
-    "start":      "node dist/server.js",
-    "build":      "tsc",
-    "seed":       "tsx --tsconfig tsconfig.json scripts/seed.ts",
-    "test":       "vitest run",
+    "dev": "tsx --tsconfig tsconfig.json server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc",
+    "seed": "tsx --tsconfig tsconfig.json scripts/seed.ts",
+    "test": "vitest run",
     "test:watch": "vitest",
-    "coverage":   "vitest run --coverage"
+    "coverage": "vitest run --coverage"
   },
   "dependencies": {
+    "@googlemaps/google-maps-services-js": "^3.4.2",
     "@langchain/core": "^1.1.40",
     "@langchain/google-genai": "^2.1.27",
     "cors": "^2.8.6",
