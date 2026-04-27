@@ -12,8 +12,8 @@
  * Start order:
  *   1. Preload .env from repo root (side-effect import; see
  *      ./config/env.ts for why this is a separate module).
- *   2. Validate required environment variables.
- *   3. Connect to MongoDB (fail fast on bad URI).
+ *   2. Validate environment variables (warn-only).
+ *   3. Connect to MongoDB (fail-safe with fallback mode).
  *   4. Apply middleware (CORS, JSON, request logger).
  *   5. Mount the /api router.
  *   6. PRODUCTION: serve the built React app as static files.
@@ -62,16 +62,16 @@ import apiRouter         from './routes/api';
 // ─────────────────────────────────────────────────────────────
 
 const REQUIRED_VARS = ['MONGODB_URI', 'GOOGLE_API_KEY', 'GOOGLE_MAPS_API_KEY'] as const;
+const missingVars = REQUIRED_VARS.filter((v) => !process.env[v]);
 
-for (const v of REQUIRED_VARS) {
-  if (!process.env[v]) {
-    console.error(`[server] Fatal: environment variable "${v}" is not set.`);
-    console.error(`         Ensure .env exists at the repo root with a valid ${v}.`);
-    process.exit(1);
-  }
+if (missingVars.length > 0) {
+  console.warn(
+    `[server] Warning: missing env vars (${missingVars.join(', ')}). ` +
+    'Server will continue in degraded mode where possible.'
+  );
 }
 
-const MONGODB_URI = process.env.MONGODB_URI!;
+const MONGODB_URI = process.env.MONGODB_URI;
 const PORT        = parseInt(process.env.PORT ?? '5000', 10);
 const NODE_ENV    = process.env.NODE_ENV ?? 'development';
 const CORS_ORIGIN = process.env.CORS_ORIGIN ?? 'http://localhost:3000';
@@ -80,21 +80,35 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN ?? 'http://localhost:3000';
 // 3. MongoDB connection
 // ─────────────────────────────────────────────────────────────
 
-async function connectDB(): Promise<void> {
+async function connectDB(): Promise<boolean> {
+  if (!MONGODB_URI) {
+    console.warn('[mongodb] MONGODB_URI missing. Running with in-memory fallback mode.');
+    process.env.MERIDIAN_DB_CONNECTED = 'false';
+    return false;
+  }
+
   try {
-    await mongoose.connect(MONGODB_URI, {
+    const connectPromise = mongoose.connect(MONGODB_URI, {
       serverSelectionTimeoutMS: 8_000,
       socketTimeoutMS:          45_000,
     });
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('Mongo connect timeout after 10s')), 10_000);
+    });
+    await Promise.race([connectPromise, timeoutPromise]);
 
     console.log(`[mongodb] Connected  →  ${maskUri(MONGODB_URI)}`);
 
     await mongoose.connection.syncIndexes();
     console.log('[mongodb] 2dsphere indexes synchronized');
+    process.env.MERIDIAN_DB_CONNECTED = 'true';
+    return true;
 
   } catch (err) {
-    console.error('[mongodb] Connection failed:', err instanceof Error ? err.message : err);
-    process.exit(1);
+    console.warn('[mongodb] Connection failed. Continuing with fallback mode.');
+    console.warn('[mongodb] Reason:', err instanceof Error ? err.message : err);
+    process.env.MERIDIAN_DB_CONNECTED = 'false';
+    return false;
   }
 }
 
@@ -207,7 +221,7 @@ app.use((_req: Request, res: Response) => {
 // ─────────────────────────────────────────────────────────────
 
 async function bootstrap(): Promise<void> {
-  await connectDB();
+  const dbConnected = await connectDB();
 
   app.listen(PORT, () => {
     console.log('');
@@ -219,14 +233,21 @@ async function bootstrap(): Promise<void> {
     } else {
       console.log(`  ║   Serving client build from ./public/    ║`);
     }
+    if (!dbConnected) {
+      console.log('  ║   Fallback mode: DB unavailable          ║');
+    }
     console.log('  ╚══════════════════════════════════════════╝');
     console.log('');
   });
 }
 
 bootstrap().catch((err) => {
-  console.error('[bootstrap] Fatal error:', err);
-  process.exit(1);
+  console.error('[bootstrap] Error during startup:', err);
+  console.warn('[bootstrap] Continuing to serve API in fallback mode.');
+  process.env.MERIDIAN_DB_CONNECTED = 'false';
+  app.listen(PORT, () => {
+    console.log(`[server] Listening on http://localhost:${PORT} (fallback mode)`);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -235,8 +256,10 @@ bootstrap().catch((err) => {
 
 async function shutdown(signal: string): Promise<void> {
   console.log(`\n[server] ${signal} received — shutting down gracefully…`);
-  await mongoose.connection.close();
-  console.log('[mongodb] Connection closed.');
+  if (mongoose.connection.readyState === 1) {
+    await mongoose.connection.close();
+    console.log('[mongodb] Connection closed.');
+  }
   process.exit(0);
 }
 

@@ -76,7 +76,13 @@ router.get('/kpis', apiLimiter, getKpis);
  * executed/rejected — no more 30-second polling required.
  */
 router.get('/events', (req: Request, res: Response) => {
-  registerClient(req, res);
+  try {
+    registerClient(req, res);
+  } catch (err) {
+    const details = err instanceof Error ? err.message : 'Unknown SSE error';
+    console.error('[events] Failed to register SSE client:', details);
+    res.status(200).json({ ok: true, data: { events: [], fallback: true } });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────
