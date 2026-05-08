@@ -3,7 +3,6 @@
 // v2 — interactive routes, floating card, ripple, polish
 // ============================================================
 
-const GMAP_API_KEY = "AIzaSyC-4wDguS9TKxEJcZ1bncrCzCr4_eDIIDg";
 
 // ── Great-circle arc ─────────────────────────────────────────
 function gcArc(a, b, steps) {
